@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BASE_URL="${MDV_REPO_PUBLIC_BASE:-http://www.lixw.site:18081/repository/modiverse-runtime/platforms}"
+BASE_URL="${MDV_REPO_PUBLIC_BASE:-http://www.lixw.site:18081/repository/modiverse-secra-time/platforms}"
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -132,7 +132,7 @@ EOF
   cat >"$root/meta/index.json" <<EOF
 {
   "schemaVersion": 1,
-  "repository": "modiverse-runtime",
+  "repository": "modiverse-secra-time",
   "platform": {
     "os": "linux",
     "version": "glibc",

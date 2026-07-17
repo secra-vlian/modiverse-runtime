@@ -20,7 +20,7 @@ if [[ "${1:-}" == "x86_64" || "${1:-}" == "aarch64" ]]; then
   ARCHES=("$1")
 fi
 
-BASE_URL="${MDV_REPO_PUBLIC_BASE:-http://www.lixw.site:18081/repository/modiverse-runtime/platforms}"
+BASE_URL="${MDV_REPO_PUBLIC_BASE:-http://www.lixw.site:18081/repository/modiverse-secra-time/platforms}"
 
 download() {
   local url="$1"
