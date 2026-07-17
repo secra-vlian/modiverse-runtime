@@ -1,0 +1,10 @@
+.DS_Store
+._*
+
+# Runtime archives are published as GitHub/Gitee Release assets, not committed to Git.
+runtime/**/*.tar.gz
+
+# Build output remains local and can be regenerated.
+runtime/**/build.log
+dist/
+.tmp/
