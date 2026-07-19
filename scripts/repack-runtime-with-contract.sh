@@ -23,6 +23,13 @@ test -x "$OVERLAY/bin/mdv-$NAME"
 tar -xzf "$INPUT" -C "$WORK"
 cp -R "$OVERLAY/." "$WORK/"
 chmod 755 "$WORK"
-tar -czf "$TEMP_OUTPUT" -C "$WORK" .
+# Drop macOS-only junk so Linux GNU tar won't warn on unknown PAX headers
+# (e.g. LIBARCHIVE.xattr.com.apple.provenance) and AppleDouble files aren't
+# mistaken for Runtime configuration.
+find "$WORK" -depth \( -name '._*' -o -name '.DS_Store' -o -name '__MACOSX' \) -delete
+if command -v xattr >/dev/null 2>&1; then
+  xattr -cr "$WORK" 2>/dev/null || true
+fi
+COPYFILE_DISABLE=1 tar --no-xattrs --no-acls --no-fflags -czf "$TEMP_OUTPUT" -C "$WORK" .
 mv "$TEMP_OUTPUT" "$OUTPUT"
 sha256sum "$OUTPUT"
