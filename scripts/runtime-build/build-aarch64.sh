@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Builds installer-ready Linux aarch64 Runtime archives inside Debian 13 arm64.
+# Builds installer-ready Linux aarch64 Runtime archives on Rocky Linux 8 (glibc 2.28).
 
 set -euo pipefail
 
-export DEBIAN_FRONTEND=noninteractive
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORK_ROOT=/build
@@ -12,7 +11,7 @@ STAGE_ROOT="$WORK_ROOT/stage"
 OUTPUT_ROOT=/workspace/runtime/aarch64
 TEMPLATE_ROOT=/workspace/runtime/x86_64
 SELECTED_COMPONENT="${MDV_BUILD_COMPONENT:-all}"
-JOBS="$(nproc)"
+JOBS="${MDV_BUILD_JOBS:-$(nproc)}"
 
 NGINX_VERSION=1.28.3
 OPENSSL_VERSION=3.5.7
@@ -27,12 +26,34 @@ OPENOBSERVE_VERSION=0.91.1
 FFMPEG_VERSION=8.1.2
 LIBREOFFICE_VERSION=26.2.4
 POPPLER_VERSION=26.07.0
+FREETYPE_VERSION=2.13.3
+FONTCONFIG_VERSION=2.15.0
+TIFF_VERSION=4.7.0
+LCMS_VERSION=2.16
 
-# Installs the compiler toolchain and development libraries shared by source builds.
+# Installs the compiler toolchain when the image marker is absent (local fallback).
 install_build_dependencies() {
   if [[ -f /opt/mdv-aarch64-builder-ready ]]; then
     return
   fi
+  if command -v dnf >/dev/null 2>&1; then
+    dnf -y install epel-release
+    dnf -y install ca-certificates curl file patchelf pax-utils python3 tar which xz bzip2
+    if [[ "$SELECTED_COMPONENT" != "all" ]] && [[ "$SELECTED_COMPONENT" =~ ^(tusd|opentelemetry|openobserve)$ ]]; then
+      return
+    fi
+    dnf -y install \
+      autoconf automake bison boost-devel bzip2 bzip2-devel cmake cups-libs dbus-libs \
+      flex fontconfig-devel freetype-devel gcc gcc-c++ gettext git glibc-devel \
+      harfbuzz-devel libICE libSM libX11 libXext libXinerama libXrender \
+      libcurl-devel libjpeg-turbo-devel libpng-devel libsodium-devel \
+      libtiff-devel libtool libvorbis-devel libvpx-devel libwebp-devel libxcb \
+      libxml2-devel libzstd-devel lz4-devel make meson nasm ninja-build \
+      nss-devel openjpeg2-devel openssl-devel opus-devel perl pkgconfig \
+      python3-devel python3-setuptools python3-wheel yasm zlib-devel zstd
+    return
+  fi
+  export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y --no-install-recommends \
     ca-certificates curl file patchelf pax-utils python3 tar xz-utils
@@ -61,10 +82,22 @@ component_selected() {
 download_file() {
   local url="$1"
   local output="$2"
+  local attempt
   mkdir -p "$(dirname "$output")"
   if [[ ! -s "$output" ]]; then
-    curl -fL --retry 4 --retry-delay 2 -A 'ModiverseRuntimeBuilder/1.0' -o "$output.partial" "$url"
-    mv "$output.partial" "$output"
+    for attempt in 1 2 3 4 5; do
+      if curl -fL --connect-timeout 20 --max-time 300 \
+        -A 'ModiverseRuntimeBuilder/1.0' -o "$output.partial" "$url"; then
+        mv "$output.partial" "$output"
+        return
+      fi
+      rm -f "$output.partial"
+      if ((attempt < 5)); then
+        sleep $((attempt * 2))
+      fi
+    done
+    echo "failed to download $url after 5 attempts" >&2
+    return 1
   fi
 }
 
@@ -105,17 +138,24 @@ bundle_dependencies() {
   local stage="$1"
   shift
   local dependency
+  local dependency_tree
+  local dependency_search_path="$stage/lib:$stage/lib64:/usr/local/lib:/usr/local/lib64"
   local target
+  local -a targets=("$@")
   mkdir -p "$stage/lib"
-  for target in "$@"; do
+  for target in "${targets[@]}"; do
     while IFS= read -r dependency; do
       [[ -f "$dependency" ]] || continue
       case "$dependency" in
         */ld-linux-aarch64.so.1) continue ;;
+        */libc.so.6|*/libm.so.6|*/libpthread.so.0|*/libdl.so.2|*/librt.so.1|*/libresolv.so.2) continue ;;
         "$stage"/*) continue ;;
       esac
       cp -Lf "$dependency" "$stage/lib/$(basename "$dependency")"
-    done < <(lddtree -l "$target" 2>/dev/null | sort -u)
+    done < <(
+      LD_LIBRARY_PATH="$dependency_search_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        lddtree -l "$target" 2>/dev/null | sort -u
+    )
   done
 
   find "$stage/bin" "$stage/sbin" -type f -exec sh -c '
@@ -135,6 +175,17 @@ bundle_dependencies() {
       fi
     done
   ' sh {} +
+
+  for target in "${targets[@]}"; do
+    dependency_tree="$({
+      LD_LIBRARY_PATH="$stage/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        lddtree "$target"
+    } 2>&1)"
+    if grep -q '=> not found' <<<"$dependency_tree"; then
+      printf 'unresolved Runtime dependencies for %s:\n%s\n' "$target" "$dependency_tree" >&2
+      return 1
+    fi
+  done
 }
 
 # Discovers every ELF object below a tree and bundles their combined dependencies.
@@ -171,6 +222,28 @@ write_metadata() {
   done
 }
 
+# Materializes symlinks and hard links as regular files so installer unpack stays fail-closed.
+sanitize_stage_links() {
+  local stage="$1"
+  local path
+  local target
+  # Convert directory-tree hard links and symlinks into independent regular files.
+  while IFS= read -r -d '' path; do
+    if [[ -L "$path" ]]; then
+      target=$(readlink -f "$path")
+      [[ -f "$target" ]] || continue
+      rm -f "$path"
+      cp -a "$target" "$path"
+    fi
+  done < <(find "$stage" -type l -print0)
+  # Collapse same-inode hard links by rewriting every duplicate as a fresh copy.
+  find "$stage" -type f -links +1 -print0 \
+    | while IFS= read -r -d '' path; do
+        cp -a --remove-destination "$path" "$path.copying"
+        mv "$path.copying" "$path"
+      done
+}
+
 # Creates the release archive, checksum file, and captured build log.
 package_runtime() {
   local name="$1"
@@ -181,8 +254,9 @@ package_runtime() {
   if [[ "$name" == "opentelemetry" ]]; then
     archive="$output_dir/opentelemetry-collector-$version-linux-aarch64.tar.gz"
   fi
+  sanitize_stage_links "$stage"
   mkdir -p "$output_dir"
-  tar --sort=name --owner=0 --group=0 --numeric-owner -czf "$archive.installing" -C "$stage" .
+  tar --sort=name --owner=0 --group=0 --numeric-owner --hard-dereference -czf "$archive.installing" -C "$stage" .
   mv "$archive.installing" "$archive"
   printf '%s  %s\n' "$(sha256_file "$archive")" "$(basename "$archive")" >"$archive.sha256"
   file "$stage"/bin/* "$stage"/sbin/* 2>/dev/null | grep -E 'ELF|script' >"$output_dir/build.log" || true
@@ -219,14 +293,21 @@ build_nginx() {
       --without-mail_pop3_module --without-mail_imap_module --without-mail_smtp_module \
       --with-pcre="$WORK_ROOT/pcre2-$PCRE2_VERSION" --with-pcre-jit \
       --with-openssl="$WORK_ROOT/openssl-$OPENSSL_VERSION" \
-      --with-openssl-opt='no-weak-ssl-ciphers' --with-zlib="$WORK_ROOT/zlib-$ZLIB_VERSION" \
+      --with-openssl-opt='no-weak-ssl-ciphers no-tests no-docs' --with-zlib="$WORK_ROOT/zlib-$ZLIB_VERSION" \
       --with-cc-opt='-O2 -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fno-strict-aliasing' \
       --with-ld-opt='-Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -pie'
     make -j"$JOBS"
     make install DESTDIR="$stage"
   )
   mkdir -p "$stage/bin" "$stage/logs" "$stage/run" "$stage/tmp"
-  ln -s ../sbin/nginx "$stage/bin/nginx"
+  cat >"$stage/bin/nginx" <<'EOF'
+#!/usr/bin/env bash
+# Launch Nginx using paths relative to this extracted Runtime directory.
+set -euo pipefail
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+exec "$ROOT/sbin/nginx" -p "$ROOT/" "$@"
+EOF
+  chmod 0755 "$stage/bin/nginx"
   apply_contract nginx "$NGINX_VERSION" "$stage"
   bundle_dependencies "$stage" "$stage/sbin/nginx"
   write_metadata nginx "$NGINX_VERSION" "$stage" "$nginx_src" "$openssl_src" "$pcre_src" "$zlib_src"
@@ -350,28 +431,20 @@ EOF
   package_runtime openobserve "$OPENOBSERVE_VERSION" "$stage"
 }
 
-# Builds FFmpeg with the same major codec families enabled as the x86_64 Runtime.
+# Packages a portable BtbN FFmpeg build (glibc 2.28 / linuxarm64) instead of
+# compiling codecs that are missing from Rocky Linux 8 AppStream.
 build_ffmpeg() {
   local stage="$STAGE_ROOT/ffmpeg"
-  local source="$SOURCE_ROOT/ffmpeg-$FFMPEG_VERSION.tar.xz"
-  mkdir -p "$stage"
-  download_file "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" "$source"
+  local source="$SOURCE_ROOT/ffmpeg-n8.1-latest-linuxarm64-gpl-8.1.tar.xz"
+  mkdir -p "$stage/bin"
+  download_file \
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linuxarm64-gpl-8.1.tar.xz" \
+    "$source"
   tar -xJf "$source" -C "$WORK_ROOT"
-  (
-    cd "$WORK_ROOT/ffmpeg-$FFMPEG_VERSION"
-    ./configure --prefix=/usr/local --disable-debug --enable-gpl --enable-version3 \
-      --enable-libx264 --enable-libx265 --enable-libvpx --enable-libopus --enable-libvorbis \
-      --enable-libwebp --enable-libaom --enable-libdav1d --enable-libass \
-      --enable-libfreetype --enable-libfontconfig --enable-libharfbuzz --enable-openssl \
-      --extra-cflags='-O3 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2' \
-      --extra-ldflags='-Wl,-z,relro,-z,now,-z,noexecstack'
-    make -j"$JOBS"
-    make install DESTDIR="$stage"
-  )
-  cp -a "$stage/usr/local/." "$stage/"
-  find "$stage/usr" -depth -delete
+  local extracted
+  extracted="$(find "$WORK_ROOT" -maxdepth 1 -type d -name 'ffmpeg-n8.1-*-linuxarm64-gpl-8.1' -print -quit)"
+  cp -a "$extracted/bin/ffmpeg" "$extracted/bin/ffprobe" "$stage/bin/"
   apply_contract ffmpeg "$FFMPEG_VERSION" "$stage"
-  bundle_dependencies "$stage" "$stage/bin/ffmpeg" "$stage/bin/ffprobe"
   write_metadata ffmpeg "$FFMPEG_VERSION" "$stage" "$source"
   package_runtime ffmpeg "$FFMPEG_VERSION" "$stage"
 }
@@ -380,14 +453,69 @@ build_ffmpeg() {
 build_poppler() {
   local stage="$STAGE_ROOT/poppler"
   local source="$SOURCE_ROOT/poppler-$POPPLER_VERSION.tar.xz"
+  local freetype_source="$SOURCE_ROOT/freetype-$FREETYPE_VERSION.tar.xz"
+  local fontconfig_source="$SOURCE_ROOT/fontconfig-$FONTCONFIG_VERSION.tar.xz"
+  local tiff_source="$SOURCE_ROOT/tiff-$TIFF_VERSION.tar.xz"
+  local lcms_source="$SOURCE_ROOT/lcms2-$LCMS_VERSION.tar.gz"
+  local poppler_cc=gcc
+  local poppler_cxx=g++
+  if [[ -x /opt/rh/gcc-toolset-14/root/usr/bin/gcc ]]; then
+    poppler_cc=/opt/rh/gcc-toolset-14/root/usr/bin/gcc
+    poppler_cxx=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+  fi
   mkdir -p "$stage"
   download_file "https://poppler.freedesktop.org/poppler-$POPPLER_VERSION.tar.xz" "$source"
+  download_file \
+    "https://download.savannah.gnu.org/releases/freetype/freetype-$FREETYPE_VERSION.tar.xz" \
+    "$freetype_source"
+  download_file \
+    "https://www.freedesktop.org/software/fontconfig/release/fontconfig-$FONTCONFIG_VERSION.tar.xz" \
+    "$fontconfig_source"
+  download_file \
+    "https://download.osgeo.org/libtiff/tiff-$TIFF_VERSION.tar.xz" \
+    "$tiff_source"
+  download_file \
+    "https://github.com/mm2/Little-CMS/releases/download/lcms$LCMS_VERSION/lcms2-$LCMS_VERSION.tar.gz" \
+    "$lcms_source"
+  tar -xJf "$freetype_source" -C "$WORK_ROOT"
+  (
+    cd "$WORK_ROOT/freetype-$FREETYPE_VERSION"
+    ./configure --prefix=/usr/local --with-harfbuzz=no
+    make -j"$JOBS"
+    make install
+  )
+  tar -xJf "$fontconfig_source" -C "$WORK_ROOT"
+  (
+    cd "$WORK_ROOT/fontconfig-$FONTCONFIG_VERSION"
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+      ./configure --prefix=/usr/local --disable-docs
+    make -j"$JOBS"
+    make install
+  )
+  tar -xzf "$lcms_source" -C "$WORK_ROOT"
+  (
+    cd "$WORK_ROOT/lcms2-$LCMS_VERSION"
+    ./configure --prefix=/usr/local
+    make -j"$JOBS"
+    make install
+  )
+  tar -xJf "$tiff_source" -C "$WORK_ROOT"
+  (
+    cd "$WORK_ROOT/tiff-$TIFF_VERSION"
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./configure --prefix=/usr/local
+    make -j"$JOBS"
+    make install
+  )
   tar -xJf "$source" -C "$WORK_ROOT"
-  cmake -S "$WORK_ROOT/poppler-$POPPLER_VERSION" -B "$WORK_ROOT/poppler-build" -G Ninja \
+  CC="$poppler_cc" CXX="$poppler_cxx" \
+    cmake -S "$WORK_ROOT/poppler-$POPPLER_VERSION" -B "$WORK_ROOT/poppler-build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCMAKE_PREFIX_PATH=/usr/local \
     -DBUILD_GTK_TESTS=OFF -DBUILD_QT5_TESTS=OFF -DBUILD_QT6_TESTS=OFF \
     -DENABLE_QT5=OFF -DENABLE_QT6=OFF -DENABLE_GLIB=OFF -DENABLE_CPP=ON \
-    -DENABLE_UTILS=ON -DENABLE_GPGME=OFF -DBUILD_SHARED_LIBS=ON \
+    -DENABLE_UTILS=ON -DENABLE_GPGME=OFF -DENABLE_BOOST=OFF -DENABLE_LIBCURL=OFF \
+    -DBUILD_SHARED_LIBS=ON \
     -DCMAKE_C_FLAGS_RELEASE='-O3 -DNDEBUG -fstack-protector-strong -D_FORTIFY_SOURCE=2' \
     -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -fstack-protector-strong -D_FORTIFY_SOURCE=2'
   cmake --build "$WORK_ROOT/poppler-build" --parallel "$JOBS"
@@ -396,7 +524,8 @@ build_poppler() {
   find "$stage/usr" -depth -delete
   apply_contract poppler "$POPPLER_VERSION" "$stage"
   bundle_dependencies "$stage" "$stage/bin/pdftotext" "$stage/bin/pdftoppm" "$stage/bin/pdfinfo"
-  write_metadata poppler "$POPPLER_VERSION" "$stage" "$source"
+  write_metadata poppler "$POPPLER_VERSION" "$stage" \
+    "$source" "$freetype_source" "$fontconfig_source" "$tiff_source" "$lcms_source"
   package_runtime poppler "$POPPLER_VERSION" "$stage"
 }
 

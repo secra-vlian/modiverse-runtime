@@ -4,8 +4,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILDER_IMAGE="${MDV_AARCH64_BUILDER_IMAGE:-modiverse-runtime-aarch64-builder:local}"
-BUILDER_BASE_IMAGE="${MDV_AARCH64_BUILDER_BASE_IMAGE:-debian:13}"
+BUILDER_BASE_IMAGE="${MDV_AARCH64_BUILDER_BASE_IMAGE:-rockylinux:8}"
+BUILDER_IMAGE="${MDV_AARCH64_BUILDER_IMAGE:-modiverse-runtime-aarch64-builder:rocky8}"
 COMPONENT="${1:-all}"
 
 # Rejects unknown component names before starting an expensive container build.
@@ -40,7 +40,7 @@ ensure_builder_image() {
   done
   docker build --platform linux/arm64 \
     --build-arg "BASE_IMAGE=$BUILDER_BASE_IMAGE" \
-    "${proxy_args[@]}" \
+    ${proxy_args[@]+"${proxy_args[@]}"} \
     -t "$BUILDER_IMAGE" \
     -f "$REPO_ROOT/scripts/runtime-build/Dockerfile.aarch64" \
     "$REPO_ROOT"
@@ -59,7 +59,8 @@ run_builder() {
     -e "MDV_BUILD_COMPONENT=$COMPONENT" \
     -e "MDV_HOST_UID=$(id -u)" \
     -e "MDV_HOST_GID=$(id -g)" \
-    "${proxy_args[@]}" \
+    -e "MDV_BUILD_JOBS=${MDV_BUILD_JOBS:-}" \
+    ${proxy_args[@]+"${proxy_args[@]}"} \
     -v "$REPO_ROOT:/workspace" \
     -w /workspace \
     "$BUILDER_IMAGE" \

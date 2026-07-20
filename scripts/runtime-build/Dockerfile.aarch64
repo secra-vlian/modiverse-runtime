@@ -1,20 +1,57 @@
-# Provides the native ARM64 compiler and dependency toolchain for Runtime builds.
-ARG BASE_IMAGE=debian:13
+# Rocky Linux 8 arm64 toolchain for portable glibc 2.28 Runtime builds.
+ARG BASE_IMAGE=rockylinux:8
 FROM ${BASE_IMAGE}
 
-ENV DEBIAN_FRONTEND=noninteractive
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG CMAKE_VERSION=3.31.8
+ARG CMAKE_AARCH64_SHA256=609735983e3bdf24b6ab379d918458d64196fe72b98226f62dd5e9fe7b2997cc
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-      autoconf automake bison build-essential ca-certificates cmake curl file flex \
-      gettext git libaom-dev libass-dev libboost-dev libbz2-dev libcurl4-openssl-dev \
-      libdav1d-dev libdeflate-dev libfontconfig1-dev libfreetype-dev libharfbuzz-dev \
-      libcups2 libdbus-1-3 libice6 libjpeg-dev liblcms2-dev liblz4-dev libnss3-dev \
-      libopenjp2-7-dev libopus-dev libsm6 libx11-6 libx11-xcb1 libxcb1 libxext6 libxinerama1 \
-      libxrender1 \
-      libpng-dev libsodium-dev libssl-dev libtiff-dev libtool libvorbis-dev \
-      libvpx-dev libwebp-dev libx264-dev libx265-dev libxml2-dev libzstd-dev \
-      meson nasm ninja-build patchelf pax-utils perl pkg-config python3 python3-dev \
-      python3-pyelftools python3-setuptools python3-wheel tar xz-utils yasm zlib1g-dev zstd \
-    && rm -rf /var/lib/apt/lists/* \
+# CRB + EPEL provide meson/ninja/nasm and several *-devel packages used by Poppler.
+RUN dnf -y install dnf-plugins-core \
+    && dnf -y install epel-release \
+    && /usr/bin/crb enable \
+    && dnf -y clean all \
+    && dnf -y makecache \
+    && dnf -y install \
+      autoconf automake bison bzip2 bzip2-devel boost-devel ca-certificates cmake \
+      cups-libs curl dbus-libs dpkg file flex fontconfig-devel freetype-devel gcc \
+      gcc-c++ gettext git glibc-devel harfbuzz-devel libICE libSM libX11 \
+      libXext libXinerama libXrender libcurl-devel libjpeg-turbo-devel \
+      libpng-devel libsodium-devel libtiff-devel libtool libvorbis-devel \
+      libvpx-devel libwebp-devel libxcb libxml2-devel libzstd-devel lz4-devel \
+      make meson nasm ninja-build nss-devel openjpeg2-devel openssl-devel \
+      opus-devel patch patchelf pax-utils perl pkgconfig python3 python3-devel \
+      python3-pip python3-setuptools python3-wheel tar which xz xz-devel \
+      yasm zlib-devel zstd \
+    && curl -fsSL \
+      "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-aarch64.tar.gz" \
+      -o /tmp/cmake-linux-aarch64.tar.gz \
+    && printf '%s  %s\n' "$CMAKE_AARCH64_SHA256" /tmp/cmake-linux-aarch64.tar.gz \
+      | sha256sum -c - \
+    && mkdir -p /opt/cmake \
+    && tar -xzf /tmp/cmake-linux-aarch64.tar.gz --strip-components=1 -C /opt/cmake \
+    && ln -sf /opt/cmake/bin/cmake /usr/local/bin/cmake \
+    && ln -sf /opt/cmake/bin/ctest /usr/local/bin/ctest \
+    && ln -sf /opt/cmake/bin/cpack /usr/local/bin/cpack \
+    && rm -f /tmp/cmake-linux-aarch64.tar.gz \
+    && dnf clean all \
     && touch /opt/mdv-aarch64-builder-ready
+
+# Fontconfig regenerates lookup tables and configure probes require cmp/diff.
+RUN dnf -y install diffutils gperf \
+    && dnf clean all
+
+# Poppler 26.07 requires C++23 while preserving the Rocky 8 glibc baseline.
+ARG GCC_TOOLSET_VERSION=14.2.1-11.el8_10
+RUN dnf -y install \
+      "https://download.rockylinux.org/pub/rocky/8/AppStream/aarch64/os/Packages/g/gcc-toolset-14-gcc-${GCC_TOOLSET_VERSION}.aarch64.rpm" \
+      "https://download.rockylinux.org/pub/rocky/8/AppStream/aarch64/os/Packages/g/gcc-toolset-14-gcc-c++-${GCC_TOOLSET_VERSION}.aarch64.rpm" \
+    && dnf clean all
+
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH}
+ENV LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64
