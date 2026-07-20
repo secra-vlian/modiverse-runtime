@@ -16,18 +16,24 @@ runtime/
 
 构建脚本位于 `scripts/`。Runtime 软件包统一命名为 `<software>-<version>-linux-<arch>.tar.gz`，例如 `nginx-1.28.3-linux-x86_64.tar.gz`。
 
-在 Apple Silicon 或其他原生 ARM64 Docker 主机上，默认以 **Rocky Linux 8（glibc 2.28）** 为基线构建完整 aarch64 Runtime，便于覆盖 Debian 12 / RHEL 8+ 等目标机：
+在 Apple Silicon 或其他原生 ARM64 Docker 主机上，默认以 **manylinux2014（glibc 2.17）** 为基线构建完整 aarch64 Runtime，与 x86_64 制品对齐，兼容 CentOS 7 / Debian 12 / RHEL 8+ 等目标机：
 
 ```bash
 scripts/build-aarch64-runtime.sh
 ```
 
-可通过环境变量覆盖基础镜像，例如仍使用 Debian：
+可通过环境变量覆盖基础镜像（须保持 glibc ≤ 2.17）：
 
 ```bash
-MDV_AARCH64_BUILDER_BASE_IMAGE=debian:12 \
-MDV_AARCH64_BUILDER_IMAGE=modiverse-runtime-aarch64-builder:bookworm \
+MDV_AARCH64_BUILDER_BASE_IMAGE=quay.io/pypa/manylinux2014_aarch64 \
+MDV_AARCH64_BUILDER_IMAGE=modiverse-runtime-aarch64-builder:manylinux2014 \
   scripts/build-aarch64-runtime.sh
+```
+
+构建完成后可用契约门禁校验归档（禁止核心组件混入宿主 `*.so.*` / 半套 glibc）：
+
+```bash
+scripts/verify-aarch64-runtime.sh
 ```
 
 也可仅重建单个组件，例如 `scripts/build-aarch64-runtime.sh redis`。脚本会向镜像构建与下载容器透传 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`（含小写形式）。产物写入 `runtime/aarch64/<software>/<version>/`，并同步生成 `.sha256` 与 `build.log`。

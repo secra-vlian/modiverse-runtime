@@ -5,8 +5,8 @@
 #   linux-x86_64-glibc
 #   linux-aarch64-glibc
 #
-# Prefers official prebuilt binaries that target older glibc (≈2.28+) where
-# available. Distro-specific .deb/.rpm are intentionally omitted.
+# Prefers official prebuilt binaries that target older glibc (baseline 2.17 /
+# manylinux2014) where available. Distro-specific .deb/.rpm are intentionally omitted.
 # Infra without portable binaries (nginx / postgresql / redis / zeromq) keep
 # upstream source tarballs for the build farm → runtime package pipeline.
 
@@ -147,7 +147,7 @@ download_arch() {
     "$legacy/source/poppler/poppler-22.12.0.tar.xz"
 
   #######################################
-  # Portable prebuilt binaries (prefer glibc≈2.28 targets)
+  # Portable prebuilt binaries (prefer glibc 2.17 / manylinux2014 targets)
   # Only reuse debian-12-amd64 artifacts when filling x86_64 (same arch).
   #######################################
 
@@ -184,7 +184,8 @@ download_arch() {
     "$root/binary/openobserve/openobserve-v0.91.0-linux-${oo_arch}.tar.gz" \
     ${reuse_oo[@]+"${reuse_oo[@]}"}
 
-  # BtbN static builds target RHEL/CentOS 8 (glibc 2.28) — widest glibc portability.
+  # BtbN static builds target RHEL/CentOS 8 (glibc 2.28); Runtime farm may rebuild
+  # on manylinux2014 when a glibc ≤2.17 gate is required.
   reuse_or_download \
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-${ffmpeg_label}-gpl-8.1.tar.xz" \
     "$root/binary/ffmpeg/ffmpeg.tar.xz" \
@@ -217,7 +218,7 @@ platform:
   arch: ${arch}
   id: ${platform}
   notes: >
-    Portable glibc baseline (prefer builds linked against glibc ≥2.28).
+    Portable glibc baseline (prefer builds linked against glibc 2.17 / manylinux2014).
     Prefer packageType=binary; source packages feed the build farm.
 
 packages:
@@ -248,7 +249,7 @@ packages:
   ffmpeg:
     version: 8.1
     packageType: binary
-    baseline: glibc-2.28
+    baseline: glibc-2.17
   libreoffice:
     version: ${lo_version}
     packageType: binary

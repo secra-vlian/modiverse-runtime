@@ -1,33 +1,27 @@
-# Rocky Linux 8 arm64 toolchain for portable glibc 2.28 Runtime builds.
-ARG BASE_IMAGE=rockylinux:8
+# manylinux2014 arm64 toolchain for portable glibc 2.17 Runtime builds.
+ARG BASE_IMAGE=quay.io/pypa/manylinux2014_aarch64
 FROM ${BASE_IMAGE}
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
+ARG ALL_PROXY
 ARG NO_PROXY
 ARG http_proxy
 ARG https_proxy
+ARG all_proxy
 ARG no_proxy
+ENV HTTP_PROXY=${HTTP_PROXY} HTTPS_PROXY=${HTTPS_PROXY} ALL_PROXY=${ALL_PROXY} NO_PROXY=${NO_PROXY} \
+    http_proxy=${http_proxy} https_proxy=${https_proxy} all_proxy=${all_proxy} no_proxy=${no_proxy}
 ARG CMAKE_VERSION=3.31.8
 ARG CMAKE_AARCH64_SHA256=609735983e3bdf24b6ab379d918458d64196fe72b98226f62dd5e9fe7b2997cc
 
-# CRB + EPEL provide meson/ninja/nasm and several *-devel packages used by Poppler.
-RUN dnf -y install dnf-plugins-core \
-    && dnf -y install epel-release \
-    && /usr/bin/crb enable \
-    && dnf -y clean all \
-    && dnf -y makecache \
-    && dnf -y install \
-      autoconf automake bison bzip2 bzip2-devel boost-devel ca-certificates cmake \
-      cups-libs curl dbus-libs dpkg file flex fontconfig-devel freetype-devel gcc \
-      gcc-c++ gettext git glibc-devel harfbuzz-devel libICE libSM libX11 \
-      libXext libXinerama libXrender libcurl-devel libjpeg-turbo-devel \
-      libpng-devel libsodium-devel libtiff-devel libtool libvorbis-devel \
-      libvpx-devel libwebp-devel libxcb libxml2-devel libzstd-devel lz4-devel \
-      make meson nasm ninja-build nss-devel openjpeg2-devel openssl-devel \
-      opus-devel patch patchelf pax-utils perl pkgconfig python3 python3-devel \
-      python3-pip python3-setuptools python3-wheel tar which xz xz-devel \
-      yasm zlib-devel zstd \
+# CentOS 7 yum keeps glibc at 2.17; manylinux ships a modern GCC that still links it.
+RUN yum -y install \
+      autoconf automake bison bzip2 bzip2-devel ca-certificates curl diffutils \
+      expat-devel file flex gettext git glibc-devel gperf \
+      libjpeg-turbo-devel libpng-devel libtool libxml2-devel make \
+      nss-devel patch perl perl-core perl-IPC-Cmd pkgconfig python3 python3-devel \
+      tar which xz xz-devel zlib-devel \
     && curl -fsSL \
       "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-aarch64.tar.gz" \
       -o /tmp/cmake-linux-aarch64.tar.gz \
@@ -39,19 +33,37 @@ RUN dnf -y install dnf-plugins-core \
     && ln -sf /opt/cmake/bin/ctest /usr/local/bin/ctest \
     && ln -sf /opt/cmake/bin/cpack /usr/local/bin/cpack \
     && rm -f /tmp/cmake-linux-aarch64.tar.gz \
-    && dnf clean all \
+    && yum -y clean all \
     && touch /opt/mdv-aarch64-builder-ready
 
-# Fontconfig regenerates lookup tables and configure probes require cmp/diff.
-RUN dnf -y install diffutils gperf \
-    && dnf clean all
+# Optional packaging / Poppler helpers (CMake+Ninja; meson not required).
+RUN yum -y install epel-release || true \
+    && yum -y install nasm ninja-build patchelf pax-utils python3-pip dpkg \
+    && if ! command -v ninja >/dev/null && command -v ninja-build >/dev/null; then \
+         ln -sf "$(command -v ninja-build)" /usr/local/bin/ninja; \
+       fi \
+    && command -v ninja >/dev/null \
+    && yum -y clean all
 
-# Poppler 26.07 requires C++23 while preserving the Rocky 8 glibc baseline.
-ARG GCC_TOOLSET_VERSION=14.2.1-11.el8_10
-RUN dnf -y install \
-      "https://download.rockylinux.org/pub/rocky/8/AppStream/aarch64/os/Packages/g/gcc-toolset-14-gcc-${GCC_TOOLSET_VERSION}.aarch64.rpm" \
-      "https://download.rockylinux.org/pub/rocky/8/AppStream/aarch64/os/Packages/g/gcc-toolset-14-gcc-c++-${GCC_TOOLSET_VERSION}.aarch64.rpm" \
-    && dnf clean all
+# Activate manylinux's GCC 10 while keeping glibc 2.17 as the link baseline.
+ENV PATH=/opt/rh/devtoolset-10/root/usr/bin:/opt/cmake/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV LD_LIBRARY_PATH=/opt/rh/devtoolset-10/root/usr/lib64
+ENV PC=/opt/rh/devtoolset-10/root/usr/lib/pkgconfig
 
-ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH}
-ENV LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64
+# Poppler 26 needs C++23. Install conda-forge GCC 14 (built for manylinux2014 / glibc 2.17).
+# Rocky/RHEL gcc-toolset-14 cannot run here: its binaries require GLIBC_2.25+.
+ARG CONDA_GCC_VERSION=14.1.0
+RUN curl -fsSL "https://micro.mamba.pm/api/micromamba/linux-aarch64/latest" \
+      | tar -xj -C /tmp bin/micromamba \
+    && /tmp/bin/micromamba create -y -p /opt/conda-gcc -c conda-forge \
+         "gcc_linux-aarch64=${CONDA_GCC_VERSION}" \
+         "gxx_linux-aarch64=${CONDA_GCC_VERSION}" \
+    && rm -f /tmp/bin/micromamba \
+    && test -x /opt/conda-gcc/bin/aarch64-conda-linux-gnu-g++ \
+    && /opt/conda-gcc/bin/aarch64-conda-linux-gnu-g++ --version | head -1 \
+    && echo 'int main(){return 0;}' > /tmp/t.cpp \
+    && /opt/conda-gcc/bin/aarch64-conda-linux-gnu-g++ -std=c++23 /tmp/t.cpp -o /tmp/t \
+    && rm -f /tmp/t /tmp/t.cpp
+ENV MDV_POPPLER_CC=/opt/conda-gcc/bin/aarch64-conda-linux-gnu-gcc
+ENV MDV_POPPLER_CXX=/opt/conda-gcc/bin/aarch64-conda-linux-gnu-g++
+ENV MDV_CONDA_GCC_LIBDIR=/opt/conda-gcc/lib
