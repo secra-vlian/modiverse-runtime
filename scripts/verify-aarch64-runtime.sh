@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Verifies aarch64 Runtime archives against the glibc ≤2.17 / x86_64 packaging contract.
+# Verifies aarch64 Runtime archives against the hybrid packaging contract:
+# - musl / static: must not ship libc.musl / ld-musl; skip GLIBC_* gate
+# - glibc-fallback: manylinux2014 / glibc 2.17 baseline + GLIBC_* ≤ 2.17
+# - all: must not ship glibc libc.so.6 / ld-linux*
 
 set -euo pipefail
 
@@ -34,69 +37,103 @@ pass() {
   echo "OK: $*"
 }
 
+# Reads Runtime linkage from BUILDINFO (defaults to glibc-fallback for legacy archives).
+archive_linkage() {
+  local buildinfo="$1"
+  if grep -q 'Runtime linkage: musl' <<<"$buildinfo"; then
+    printf '%s' 'musl'
+    return
+  fi
+  if grep -q 'Runtime linkage: glibc-fallback' <<<"$buildinfo"; then
+    printf '%s' 'glibc-fallback'
+    return
+  fi
+  printf '%s' 'glibc-legacy'
+}
+
 verify_archive() {
   local archive="$1"
   local name
   local tmp
   local buildinfo
   local so_list
-  local has_libc=0
-  local has_loader=0
   local elf
   local glibc_need
-  local allow_glibc_closure=0
+  local linkage
 
   name="$(basename "$archive")"
-  case "$name" in
-    openobserve-*|libreoffice-*) allow_glibc_closure=1 ;;
-  esac
 
   tmp="$(mktemp -d)"
   tar -xzf "$archive" -C "$tmp"
 
   buildinfo=""
   [[ -f "$tmp/BUILDINFO" ]] && buildinfo="$(cat "$tmp/BUILDINFO")"
+  linkage="$(archive_linkage "$buildinfo")"
 
-  if [[ "$allow_glibc_closure" -eq 0 ]]; then
-    if ! grep -q 'manylinux2014\|glibc 2\.17' <<<"$buildinfo"; then
-      fail "$name BUILDINFO missing manylinux2014 / glibc 2.17 baseline"
-    else
-      pass "$name BUILDINFO baseline"
-    fi
+  case "$linkage" in
+    musl)
+      if ! grep -qi 'musl' <<<"$buildinfo"; then
+        fail "$name BUILDINFO missing musl baseline"
+      else
+        pass "$name BUILDINFO musl baseline"
+      fi
+      ;;
+    glibc-fallback|glibc-legacy)
+      if ! grep -q 'manylinux2014\|glibc 2\.17' <<<"$buildinfo"; then
+        fail "$name BUILDINFO missing manylinux2014 / glibc 2.17 baseline"
+      else
+        pass "$name BUILDINFO glibc baseline"
+      fi
+      ;;
+  esac
+
+  so_list="$(find "$tmp" \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' -o -name 'ld-linux*' -o -name 'ld-musl*' -o -name 'libc.musl*' \) \
+    | sed "s|^$tmp/||" | sort || true)"
+
+  if grep -E 'libc\.so\.6|ld-linux' <<<"$so_list" >/dev/null; then
+    fail "$name must not ship glibc/loader, found: $(grep -E 'libc\.so\.6|ld-linux' <<<"$so_list" | tr '\n' ' ')"
   else
-    pass "$name BUILDINFO (loader-closure package)"
+    pass "$name has no glibc libc/ld-linux"
   fi
 
-  so_list="$(find "$tmp" -type f \( -name '*.so' -o -name '*.so.*' \) | sed "s|^$tmp/||" | sort || true)"
-
-  if grep -q 'libc\.so\.6' <<<"$so_list"; then has_libc=1; fi
-  if grep -q 'ld-linux-aarch64\.so\.1' <<<"$so_list"; then has_loader=1; fi
-
-  if ((has_libc != has_loader)); then
-    fail "$name incomplete glibc closure (libc=$has_libc loader=$has_loader)"
-  elif ((has_libc == 1 && allow_glibc_closure == 0)); then
-    fail "$name must not ship glibc/loader"
-  elif ((has_libc == 1)); then
-    pass "$name paired glibc closure"
+  if grep -E 'libc\.musl|ld-musl' <<<"$so_list" >/dev/null; then
+    fail "$name must not ship musl/loader, found: $(grep -E 'libc\.musl|ld-musl' <<<"$so_list" | tr '\n' ' ')"
+  else
+    pass "$name has no musl libc/ld-musl"
   fi
 
   case "$name" in
+    common-libs-*)
+      if [[ "$linkage" != musl ]]; then
+        if ! grep -q 'libcrypt\.so' <<<"$so_list"; then
+          fail "$name must contain libcrypt.so.*"
+        else
+          pass "$name contains libcrypt"
+        fi
+      fi
+      ;;
     nginx-*|redis-*)
-      if [[ -n "$so_list" ]]; then
+      if [[ "$linkage" == musl ]]; then
+        pass "$name musl delivery may include bundled .so runtime closure"
+      elif [[ -n "$so_list" ]]; then
         fail "$name must not contain shared libraries, found: $so_list"
       else
         pass "$name has no .so files"
       fi
       ;;
     postgresql-*)
-      if grep -E 'lib(ssl|crypto|z|lz4|zstd|crypt)\.so' <<<"$so_list" >/dev/null; then
+      if [[ "$linkage" == musl ]]; then
+        pass "$name musl delivery may include bundled .so runtime closure"
+      elif grep -E 'lib(ssl|crypto|z|lz4|zstd|crypt)\.so' <<<"$so_list" >/dev/null; then
         fail "$name contains forbidden host libraries"
       else
         pass "$name has no host ssl/zlib/lz4/zstd"
       fi
       ;;
     zeromq-*)
-      if grep -E 'lib(ssl|crypto|z|lz4|zstd|crypt|sodium)\.so' <<<"$so_list" >/dev/null; then
+      if [[ "$linkage" == musl ]]; then
+        pass "$name musl delivery may include bundled .so runtime closure"
+      elif grep -E 'lib(ssl|crypto|z|lz4|zstd|crypt|sodium)\.so' <<<"$so_list" >/dev/null; then
         fail "$name contains forbidden host libraries"
       else
         pass "$name ships only libzmq (no host ssl/sodium)"
@@ -104,29 +141,32 @@ verify_archive() {
       ;;
   esac
 
-  while IFS= read -r -d '' elf; do
-    [[ -f "$elf" ]] || continue
-    file "$elf" | grep -q ELF || continue
-    # Loader-closure packages intentionally run against bundled glibc.
-    if ((allow_glibc_closure == 1)); then
-      continue
-    fi
-    glibc_need="$(max_glibc_symbol "$elf")"
-    [[ -n "$glibc_need" ]] || continue
-    glibc_need="${glibc_need#GLIBC_}"
-    if ! version_le "$glibc_need" "2.17"; then
-      fail "$name $(basename "$elf") requires GLIBC_$glibc_need (> 2.17)"
-    fi
-  done < <(find "$tmp" -type f -print0)
+  if [[ "$linkage" == musl ]]; then
+    pass "$name skips GLIBC symbol gate (musl/static delivery)"
+  else
+    while IFS= read -r -d '' elf; do
+      [[ -f "$elf" ]] || continue
+      file "$elf" | grep -q ELF || continue
+      glibc_need="$(max_glibc_symbol "$elf")"
+      [[ -n "$glibc_need" ]] || continue
+      glibc_need="${glibc_need#GLIBC_}"
+      if ! version_le "$glibc_need" "2.17"; then
+        fail "$name $(basename "$elf") requires GLIBC_$glibc_need (> 2.17)"
+      fi
+    done < <(find "$tmp" -type f -print0)
+  fi
 
   rm -rf "$tmp"
 }
 
 echo "Verifying Runtime archives under $ARCH_ROOT"
+# Skip deferred / hidden quarantine trees (L1/L2 non-publish experiments).
 while IFS= read -r -d '' archive; do
   echo "---- $(basename "$archive") ----"
   verify_archive "$archive"
-done < <(find "$ARCH_ROOT" -type f -name '*-linux-aarch64.tar.gz' -print0 | sort -z)
+done < <(find "$ARCH_ROOT" \
+  \( -path '*/.*' -o -path '*/deferred*' -o -path '*/.deferred*' \) -prune -o \
+  -type f -name '*-linux-aarch64.tar.gz' -print0 | sort -z)
 
 if ((FAILED != 0)); then
   echo "Verification failed." >&2

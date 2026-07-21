@@ -17,3 +17,7 @@ runtime/**/mark.txt
 modiverse-repository/
 dist/
 .tmp/
+
+# Assembled offline media / deferred L1-L2 quarantine (regenerable).
+runtime/offline-L0-aarch64/mdv-installer
+runtime/deferred-aarch64-l1-l2/**/*.tar.gz

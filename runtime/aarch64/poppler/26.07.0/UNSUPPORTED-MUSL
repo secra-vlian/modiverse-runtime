@@ -1,0 +1,5 @@
+component: poppler
+version: 26.07.0
+runtime_linkage: glibc-fallback
+reason: no official musl package for pinned poppler 26.07.0
+delivery: built from official upstream source on manylinux2014 (glibc 2.17 baseline)

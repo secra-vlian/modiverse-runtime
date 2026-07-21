@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Orchestrates native Linux aarch64 Runtime builds through Docker Desktop.
 
 set -euo pipefail
@@ -10,7 +11,7 @@ COMPONENT="${1:-all}"
 # Rejects unknown component names before starting an expensive container build.
 validate_component() {
   case "$COMPONENT" in
-    all|nginx|postgresql|redis|zeromq|tusd|opentelemetry|openobserve|ffmpeg|poppler|libreoffice) ;;
+    all|common-libs|nginx|postgresql|redis|zeromq|tusd|opentelemetry|openobserve|ffmpeg|poppler|libreoffice) ;;
     *)
       echo "Unknown Runtime component: $COMPONENT" >&2
       exit 2

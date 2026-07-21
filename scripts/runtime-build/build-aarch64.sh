@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
-# Builds installer-ready Linux aarch64 Runtime archives on manylinux2014 (glibc 2.17).
-# Packaging contract matches x86_64: static third-party libs for core services; never
-# mix host system OpenSSL/zlib into those archives; glibc loader closures are only
-# allowed for openobserve/libreoffice and must be complete (ld-linux + libc).
+# Builds installer-ready Linux aarch64 Runtime archives (hybrid musl + glibc fallback).
+# Default: official musl (Alpine apk / musl release / static Go) where available;
+# otherwise upstream source on manylinux2014 (glibc 2.17). See aarch64-linkage.env.
+# Packaging contract (all components):
+# - never ship libc.so.6 / ld-linux* / other glibc core libs (use host glibc)
+# - shared third-party sos (e.g. libcrypt.so.2) go in common-libs only
+# - component RUNPATH must resolve $ORIGIN/../lib and common-libs/current/lib
+# - absolute symlinks rewritten to archive-root-relative at build time
+# OpenObserve is L1 deferred (official arm64 needs GLIBC 2.38+); LibreOffice is L2
+# optional and must strip glibc — never reintroduce a half glibc loader closure.
 
 set -euo pipefail
+
+RUNTIME_BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=aarch64-linkage.env
+source "$RUNTIME_BUILD_DIR/aarch64-linkage.env"
+# shellcheck source=musl-alpine.sh
+source "$RUNTIME_BUILD_DIR/musl-alpine.sh"
 
 # GNU make / curl can raise SIGPIPE when stdout is redirected; ignore it so the
 # packaging steps after a successful compile still run.
@@ -38,6 +50,7 @@ OPENOBSERVE_VERSION=0.91.1
 FFMPEG_VERSION=8.1.2
 LIBREOFFICE_VERSION=26.2.4
 POPPLER_VERSION=26.07.0
+COMMON_LIBS_VERSION=1.0.0
 FREETYPE_VERSION=2.13.3
 FONTCONFIG_VERSION=2.15.0
 TIFF_VERSION=4.7.0
@@ -197,6 +210,52 @@ set_origin_rpaths() {
   fi
 }
 
+# Sets dual RUNPATH so package-private lib/ and common-libs resolve after install.
+# From runtime/<name>/<ver>/{bin,sbin}: ../../../common-libs/current/lib.
+set_component_runpaths() {
+  local stage="$1"
+  local rpath='\$ORIGIN/../lib:\$ORIGIN/../../../common-libs/current/lib'
+  local -a roots=()
+  [[ -d "$stage/bin" ]] && roots+=("$stage/bin")
+  [[ -d "$stage/sbin" ]] && roots+=("$stage/sbin")
+  if ((${#roots[@]} > 0)); then
+    find "${roots[@]}" -type f 2>/dev/null | while read -r candidate; do
+      if file "$candidate" 2>/dev/null | grep -q ELF; then
+        patchelf --set-rpath "$rpath" "$candidate" 2>/dev/null || true
+      fi
+    done
+  fi
+  if [[ -d "$stage/lib" ]]; then
+    find "$stage/lib" -type f 2>/dev/null | while read -r candidate; do
+      if is_glibc_or_loader "$candidate"; then
+        continue
+      fi
+      if file "$candidate" 2>/dev/null | grep -q ELF; then
+        patchelf --set-rpath '\$ORIGIN:\$ORIGIN/../../../common-libs/current/lib' "$candidate" 2>/dev/null || true
+      fi
+    done
+  fi
+}
+
+# Removes glibc core libraries and the dynamic loader from a staged Runtime tree.
+strip_glibc_and_loader() {
+  local stage="$1"
+  find "$stage" \( -type f -o -type l \) \( \
+    -name 'ld-linux*.so*' -o -name 'ld-*.so' -o \
+    -name 'libc.so.6' -o -name 'libm.so.6' -o -name 'libpthread.so.0' -o \
+    -name 'libdl.so.2' -o -name 'librt.so.1' -o -name 'libresolv.so.2' -o \
+    -name 'libnss_*.so*' -o -name 'libthread_db.so.1' \
+  \) -delete 2>/dev/null || true
+  # gconv modules belong with host glibc, not Runtime archives.
+  rm -rf "$stage/lib/gconv" "$stage/lib64/gconv" 2>/dev/null || true
+}
+
+# Removes libcrypt copies that must live only in common-libs.
+strip_libcrypt_from_stage() {
+  local stage="$1"
+  find "$stage" \( -type f -o -type l \) -name 'libcrypt.so*' -delete 2>/dev/null || true
+}
+
 # Bundles non-glibc third-party deps only (poppler). Never copies loader/libc or
 # arbitrary host /lib copies that would mix build-host glibc into the archive.
 bundle_third_party_dependencies() {
@@ -248,76 +307,29 @@ bundle_third_party_dependencies() {
   done
 }
 
-# Bundles a complete Runtime-local glibc loader closure (openobserve / libreoffice).
+# DEPRECATED: glibc loader closures are forbidden on the publish path.
+# Kept only so accidental calls fail loudly instead of silently packaging libc.
 bundle_glibc_runtime_closure() {
-  local stage="$1"
-  shift
-  local dependency
-  local dependency_search_path="$stage/lib:$stage/lib64:/usr/local/lib:/usr/local/lib64"
-  local target
-  local -a targets=("$@")
-  local loader
-  mkdir -p "$stage/lib"
-  loader="$(readlink -f /lib/ld-linux-aarch64.so.1 2>/dev/null || readlink -f /lib64/ld-linux-aarch64.so.1)"
-  [[ -f "$loader" ]]
-  cp -Lf "$loader" "$stage/lib/ld-linux-aarch64.so.1"
-  for target in "${targets[@]}"; do
-    while IFS= read -r dependency; do
-      [[ -f "$dependency" ]] || continue
-      case "$dependency" in
-        "$stage"/*) continue ;;
-      esac
-      cp -Lf "$dependency" "$stage/lib/$(basename "$dependency")"
-    done < <(
-      LD_LIBRARY_PATH="$dependency_search_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        lddtree -l "$target" 2>/dev/null | sort -u
-    )
-  done
-  # Ensure the loader's own glibc companions are present even if lddtree omitted them.
-  for dependency in \
-    /lib64/libc.so.6 /lib/libc.so.6 \
-    /lib64/libm.so.6 /lib/libm.so.6 \
-    /lib64/libdl.so.2 /lib/libdl.so.2 \
-    /lib64/libpthread.so.0 /lib/libpthread.so.0 \
-    /lib64/librt.so.1 /lib/librt.so.1 \
-    /lib64/libresolv.so.2 /lib/libresolv.so.2 \
-    /lib64/libgcc_s.so.1 /lib/libgcc_s.so.1 \
-    /lib64/libnss_files.so.2 /lib/libnss_files.so.2 \
-    /lib64/libnss_dns.so.2 /lib/libnss_dns.so.2; do
-    if [[ -f "$dependency" ]]; then
-      cp -Lf "$dependency" "$stage/lib/$(basename "$dependency")"
-    fi
-  done
-  set_origin_rpaths "$stage"
-  assert_glibc_closure_complete "$stage"
+  echo "bundle_glibc_runtime_closure is disabled: Runtime must not ship libc/ld-linux" >&2
+  return 1
 }
 
-# Discovers every ELF object below a tree and bundles a complete glibc closure.
+# DEPRECATED: see bundle_glibc_runtime_closure.
 bundle_elf_tree_glibc_closure() {
-  local stage="$1"
-  local tree="$2"
-  local candidate
-  local -a elf_files=()
-  while IFS= read -r -d '' candidate; do
-    if file "$candidate" | grep -q ELF; then
-      elf_files+=("$candidate")
-    fi
-  done < <(find "$tree" -type f -print0)
-  ((${#elf_files[@]} > 0))
-  bundle_glibc_runtime_closure "$stage" "${elf_files[@]}"
+  echo "bundle_elf_tree_glibc_closure is disabled: Runtime must not ship libc/ld-linux" >&2
+  return 1
 }
 
-# Fails if libc.so.6 is present without a matching aarch64 loader (or the reverse).
-assert_glibc_closure_complete() {
+# Fails when a stage still contains glibc core libraries or the dynamic loader.
+assert_no_glibc_or_loader() {
   local stage="$1"
-  local has_libc=0
-  local has_loader=0
-  [[ -e "$stage/lib/libc.so.6" ]] && has_libc=1
-  [[ -e "$stage/lib/ld-linux-aarch64.so.1" ]] && has_loader=1
-  if ((has_libc != has_loader)); then
-    echo "incomplete glibc closure in $stage (libc=$has_libc loader=$has_loader)" >&2
-    return 1
-  fi
+  local path
+  while IFS= read -r -d '' path; do
+    if is_glibc_or_loader "$path"; then
+      echo "glibc/loader must not ship in Runtime stage: $path" >&2
+      return 1
+    fi
+  done < <(find "$stage" \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' -o -name 'ld-linux*' \) -print0 2>/dev/null)
 }
 
 # Fails when a core Runtime stage still contains forbidden host shared libraries.
@@ -346,12 +358,17 @@ write_metadata() {
   local version="$2"
   local stage="$3"
   shift 3
-  local glibc_ver
+  local glibc_ver linkage
   glibc_ver="$(ldd --version | head -1 | awk '{print $NF}')"
+  linkage="$(component_linkage "$name")"
   {
     echo "$name: $version"
     echo 'Architecture: aarch64'
-    echo "Build baseline: manylinux2014 / glibc ${glibc_ver}"
+    if [[ "$linkage" == 'glibc-source' ]]; then
+      echo "Build baseline: manylinux2014 / glibc ${glibc_ver}"
+    else
+      echo 'Build baseline: Alpine Linux / musl (official musl delivery)'
+    fi
     echo 'Hardening: RELRO, BIND_NOW, NX stack, FORTIFY, stack protector'
   } >"$stage/BUILDINFO"
   : >"$stage/SOURCE-SHA256SUMS"
@@ -361,15 +378,35 @@ write_metadata() {
   done
 }
 
-# Materializes symlinks and hard links as regular files so installer unpack stays fail-closed.
+# Materializes resolvable symlinks/hardlinks as regular files; drops absolute dangling links.
 sanitize_stage_links() {
   local stage="$1"
   local path
   local target
   while IFS= read -r -d '' path; do
     if [[ -L "$path" ]]; then
-      # Dangling links (common in desktop .deb layouts) make readlink -f fail;
-      # tolerate that under set -e so packaging can continue.
+      target="$(readlink "$path")"
+      if [[ "$target" == /* ]]; then
+        # Absolute links left by .deb layouts break installer fail-closed unpack.
+        # Prefer rewrite into the flattened stage; otherwise remove the link.
+        local relative="${target#/opt/libreoffice*/}"
+        if [[ "$relative" == "$target" ]]; then
+          relative="${target#/}"
+        fi
+        if [[ -e "$stage/$relative" || -L "$stage/$relative" ]]; then
+          local rel_target
+          rel_target="$(python3 - "$path" "$stage/$relative" <<'PY'
+import os, sys
+print(os.path.relpath(sys.argv[2], start=os.path.dirname(sys.argv[1])))
+PY
+)"
+          rm -f "$path"
+          ln -s "$rel_target" "$path"
+          continue
+        fi
+        rm -f "$path"
+        continue
+      fi
       target=$(readlink -f "$path" 2>/dev/null || true)
       [[ -n "$target" && -f "$target" ]] || continue
       rm -f "$path"
@@ -496,8 +533,103 @@ ensure_static_libsodium() {
   )
 }
 
-# Builds Nginx with OpenSSL, PCRE2, and zlib statically embedded.
-build_nginx() {
+
+# Builds the shared-library Runtime consumed via RUNPATH by dynamically linked components.
+# Ships libcrypt.so.2 (and siblings) only — never libc/ld-linux. service.enabled: false.
+build_common_libs() {
+  local stage="$STAGE_ROOT/common-libs"
+  local output_dir="$OUTPUT_ROOT/common-libs/$COMMON_LIBS_VERSION"
+  mkdir -p "$stage/lib" "$stage/bin" "$output_dir"
+
+  local path
+  for path in /usr/local/lib/libcrypt.so.2 /usr/local/lib/libcrypt.so.2.0.0 \
+              /usr/local/lib/libcrypt.so.1 /usr/local/lib/libcrypt.so.1.1.0 \
+              /usr/local/lib/libcrypt.so \
+              /lib64/libcrypt.so.2 /lib/libcrypt.so.2 \
+              /usr/lib64/libcrypt.so.2 /usr/lib/libcrypt.so.2; do
+    if [[ -e "$path" ]]; then
+      cp -a "$path" "$stage/lib/"
+    fi
+  done
+  if [[ -f "$stage/lib/libcrypt.so.2.0.0" && ! -e "$stage/lib/libcrypt.so.2" ]]; then
+    ln -s libcrypt.so.2.0.0 "$stage/lib/libcrypt.so.2"
+  fi
+  [[ -e "$stage/lib/libcrypt.so.2" ]] || {
+    echo "failed to stage libcrypt.so.2 into common-libs" >&2
+    return 1
+  }
+
+  # Prefer installer overlay entrypoint when the host mounted it; otherwise embed.
+  local overlay_bin="/workspace/../modiverse/apps/installer/runtime-entrypoints/common-libs/bin/mdv-common-libs"
+  if [[ -x "$overlay_bin" ]]; then
+    cp -a "$overlay_bin" "$stage/bin/mdv-common-libs"
+  elif [[ -n "${MDV_RUNTIME_OVERLAY_ROOT:-}" && -x "$MDV_RUNTIME_OVERLAY_ROOT/common-libs/bin/mdv-common-libs" ]]; then
+    cp -a "$MDV_RUNTIME_OVERLAY_ROOT/common-libs/bin/mdv-common-libs" "$stage/bin/mdv-common-libs"
+  else
+    cat >"$stage/bin/mdv-common-libs" <<'EOF'
+#!/bin/sh
+set -eu
+RUNTIME=${MDV_RUNTIME_VERSION_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}
+case "${1:-}" in
+  start|stop) exit 0 ;;
+  health)
+    [ -d "$RUNTIME/lib" ] || exit 1
+    find "$RUNTIME/lib" \( -type f -o -type l \) -name '*.so*' | grep -q .
+    ;;
+  *)
+    echo "usage: mdv-common-libs start|stop|health" >&2
+    exit 2
+    ;;
+esac
+EOF
+  fi
+  chmod 0755 "$stage/bin/mdv-common-libs"
+
+  cat >"$stage/manifest.yaml" <<EOF
+schemaVersion: 1
+name: common-libs
+version: $COMMON_LIBS_VERSION
+platform:
+  id: linux-aarch64-glibc
+  os: linux
+  arch: aarch64
+  libc: glibc
+package:
+  type: binary
+lifecycle:
+  entrypoint: bin/mdv-common-libs
+  commands:
+    start: start
+    stop: stop
+    health: health
+service:
+  enabled: false
+  startOrder: 0
+  dependencies: []
+health:
+  timeoutSeconds: 5
+  attempts: 1
+EOF
+
+  strip_glibc_and_loader "$stage"
+  assert_no_glibc_or_loader "$stage"
+  write_metadata common-libs "$COMMON_LIBS_VERSION" "$stage"
+  {
+    echo 'Runtime linkage: glibc-fallback'
+    echo 'Contents: shared third-party libraries for Runtime RUNPATH resolution'
+    echo 'Forbidden: libc.so.6 / ld-linux (use host glibc)'
+    echo 'Musl status: UNSUPPORTED-MUSL — no Alpine equivalent for libcrypt/common-libs bundle'
+  } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/common-libs/$COMMON_LIBS_VERSION"
+  write_glibc_fallback_marker "$output_dir" common-libs "$COMMON_LIBS_VERSION" \
+    'no Alpine/common-libs equivalent; required for glibc-fallback components'
+  record_linkage_manifest common-libs "$COMMON_LIBS_VERSION" glibc-fallback \
+    'libcrypt bundle for glibc RUNPATH components only'
+  package_runtime common-libs "$COMMON_LIBS_VERSION" "$stage"
+}
+
+# Builds Nginx with OpenSSL, PCRE2, and zlib statically embedded (glibc fallback).
+build_nginx_glibc_source() {
   local stage="$STAGE_ROOT/nginx"
   local nginx_src="$SOURCE_ROOT/nginx-$NGINX_VERSION.tar.gz"
   local openssl_src="$SOURCE_ROOT/openssl-$OPENSSL_VERSION.tar.gz"
@@ -543,16 +675,26 @@ exec "$ROOT/sbin/nginx" -p "$ROOT/" "$@"
 EOF
   chmod 0755 "$stage/bin/nginx"
   apply_contract nginx "$NGINX_VERSION" "$stage"
+  mkdir -p "$stage/lib"
+  set_component_runpaths "$stage"
   assert_no_forbidden_host_libs "$stage"
+  assert_no_glibc_or_loader "$stage"
   write_metadata nginx "$NGINX_VERSION" "$stage" "$nginx_src" "$openssl_src" "$pcre_src" "$zlib_src"
   {
+    echo 'Runtime linkage: glibc-fallback'
     echo 'OpenSSL/PCRE2/zlib: statically embedded via nginx --with-*'
+    echo 'RUNPATH: $ORIGIN/../lib:$ORIGIN/../../../common-libs/current/lib'
   } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/nginx/$NGINX_VERSION"
+  write_glibc_fallback_marker "$output_dir" nginx "$NGINX_VERSION" \
+    'Alpine musl path disabled or unavailable for this invocation'
+  record_linkage_manifest nginx "$NGINX_VERSION" glibc-fallback \
+    'source build on manylinux2014'
   package_runtime nginx "$NGINX_VERSION" "$stage"
 }
 
 # Builds PostgreSQL with statically linked OpenSSL, zlib, LZ4, and Zstandard.
-build_postgresql() {
+build_postgresql_glibc_source() {
   local stage="$STAGE_ROOT/postgresql"
   local source="$SOURCE_ROOT/postgresql-$POSTGRESQL_VERSION.tar.bz2"
   local openssl_src="$SOURCE_ROOT/openssl-$OPENSSL_VERSION.tar.gz"
@@ -604,16 +746,22 @@ build_postgresql() {
   write_metadata postgresql "$POSTGRESQL_VERSION" "$stage" \
     "$source" "$openssl_src" "$zlib_src" "$lz4_src" "$zstd_src"
   {
+    echo 'Runtime linkage: glibc-fallback'
     echo "OpenSSL: $OPENSSL_VERSION LTS (statically linked)"
     echo "zlib: $ZLIB_VERSION (statically linked)"
     echo "LZ4: $LZ4_VERSION (statically linked)"
     echo "Zstandard: $ZSTD_VERSION (statically linked)"
   } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/postgresql/$POSTGRESQL_VERSION"
+  write_glibc_fallback_marker "$output_dir" postgresql "$POSTGRESQL_VERSION" \
+    'Alpine musl path disabled or unavailable for this invocation'
+  record_linkage_manifest postgresql "$POSTGRESQL_VERSION" glibc-fallback \
+    'source build on manylinux2014'
   package_runtime postgresql "$POSTGRESQL_VERSION" "$stage"
 }
 
 # Builds Redis with TLS via statically linked OpenSSL and the bundled jemalloc.
-build_redis() {
+build_redis_glibc_source() {
   local stage="$STAGE_ROOT/redis"
   local source="$SOURCE_ROOT/redis-$REDIS_VERSION.tar.gz"
   local openssl_src="$SOURCE_ROOT/openssl-$OPENSSL_VERSION.tar.gz"
@@ -645,14 +793,20 @@ build_redis() {
   assert_no_forbidden_host_libs "$stage"
   write_metadata redis "$REDIS_VERSION" "$stage" "$source" "$openssl_src"
   {
+    echo 'Runtime linkage: glibc-fallback'
     echo 'Optimization: -O3, bundled jemalloc'
     echo "TLS: OpenSSL $OPENSSL_VERSION LTS statically linked"
   } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/redis/$REDIS_VERSION"
+  write_glibc_fallback_marker "$output_dir" redis "$REDIS_VERSION" \
+    'Alpine musl path disabled or unavailable for this invocation'
+  record_linkage_manifest redis "$REDIS_VERSION" glibc-fallback \
+    'source build on manylinux2014'
   package_runtime redis "$REDIS_VERSION" "$stage"
 }
 
 # Builds shared ZeroMQ with CURVE via statically linked libsodium.
-build_zeromq() {
+build_zeromq_glibc_source() {
   local stage="$STAGE_ROOT/zeromq"
   local source="$SOURCE_ROOT/zeromq-$ZEROMQ_VERSION.tar.gz"
   local sodium_src="$SOURCE_ROOT/libsodium-$LIBSODIUM_VERSION.tar.gz"
@@ -685,13 +839,19 @@ build_zeromq() {
   assert_no_forbidden_host_libs "$stage"
   write_metadata zeromq "$ZEROMQ_VERSION" "$stage" "$source" "$sodium_src"
   {
+    echo 'Runtime linkage: glibc-fallback'
     echo "CURVE security: libsodium $LIBSODIUM_VERSION statically linked"
   } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/zeromq/$ZEROMQ_VERSION"
+  write_glibc_fallback_marker "$output_dir" zeromq "$ZEROMQ_VERSION" \
+    'Alpine musl path disabled or unavailable for this invocation'
+  record_linkage_manifest zeromq "$ZEROMQ_VERSION" glibc-fallback \
+    'source build on manylinux2014'
   package_runtime zeromq "$ZEROMQ_VERSION" "$stage"
 }
 
-# Packages the official statically linked tusd arm64 release.
-build_tusd() {
+# Packages the official statically linked tusd arm64 release (glibc fallback path).
+build_tusd_glibc_source() {
   local stage="$STAGE_ROOT/tusd"
   local source="$SOURCE_ROOT/tusd_v$TUSD_VERSION.tar.gz"
   mkdir -p "$stage/bin"
@@ -700,11 +860,20 @@ build_tusd() {
   apply_contract tusd "$TUSD_VERSION" "$stage"
   assert_no_forbidden_host_libs "$stage"
   write_metadata tusd "$TUSD_VERSION" "$stage" "$source"
+  {
+    echo 'Runtime linkage: glibc-fallback'
+    echo 'Delivery: official tusd linux/arm64 tarball (static Go; glibc catalog path)'
+  } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/tusd/$TUSD_VERSION"
+  write_glibc_fallback_marker "$output_dir" tusd "$TUSD_VERSION" \
+    'musl-static path disabled via MDV_LINKAGE_tusd=glibc-source'
+  record_linkage_manifest tusd "$TUSD_VERSION" glibc-fallback \
+    'official static binary via glibc catalog path'
   package_runtime tusd "$TUSD_VERSION" "$stage"
 }
 
 # Packages official core and contrib OpenTelemetry Collector arm64 releases.
-build_opentelemetry() {
+build_opentelemetry_glibc_source() {
   local stage="$STAGE_ROOT/opentelemetry"
   local core="$SOURCE_ROOT/otelcol_${OTEL_VERSION}_linux_arm64.tar.gz"
   local contrib="$SOURCE_ROOT/otelcol-contrib_${OTEL_VERSION}_linux_arm64.tar.gz"
@@ -716,40 +885,54 @@ build_opentelemetry() {
   apply_contract opentelemetry "$OTEL_VERSION" "$stage"
   assert_no_forbidden_host_libs "$stage"
   write_metadata opentelemetry "$OTEL_VERSION" "$stage" "$core" "$contrib"
+  {
+    echo 'Runtime linkage: glibc-fallback'
+    echo 'Delivery: official otelcol linux/arm64 tarballs (static Go; glibc catalog path)'
+  } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/opentelemetry/$OTEL_VERSION"
+  write_glibc_fallback_marker "$output_dir" opentelemetry "$OTEL_VERSION" \
+    'musl-static path disabled via MDV_LINKAGE_opentelemetry=glibc-source'
+  record_linkage_manifest opentelemetry "$OTEL_VERSION" glibc-fallback \
+    'official static binaries via glibc catalog path'
   package_runtime opentelemetry "$OTEL_VERSION" "$stage"
 }
 
-# Packages the official OpenObserve arm64 binary with a complete glibc loader closure.
-build_openobserve() {
+# OpenObserve glibc-only path (L1 deferred when musl release unavailable).
+build_openobserve_glibc_source() {
+  echo "OpenObserve aarch64 is L1 deferred (needs GLIBC ≤2.36 build or exclusion)." >&2
+  if [[ "$SELECTED_COMPONENT" == "all" ]]; then
+    echo "Skipping OpenObserve for aarch64 L0 publish set." >&2
+    return 0
+  fi
+  if [[ "${MDV_BUILD_OPENOBSERVE_FORCE:-0}" != "1" ]]; then
+    echo "Refusing OpenObserve package: set MDV_BUILD_OPENOBSERVE_FORCE=1 only for experiments." >&2
+    echo "Publish path must not reintroduce a glibc loader closure." >&2
+    return 1
+  fi
   local stage="$STAGE_ROOT/openobserve"
   local source="$SOURCE_ROOT/openobserve-v$OPENOBSERVE_VERSION-linux-arm64.tar.gz"
-  mkdir -p "$stage/bin" "$stage/lib"
+  mkdir -p "$stage/bin"
   download_file "https://downloads.openobserve.ai/releases/openobserve/v$OPENOBSERVE_VERSION/openobserve-v$OPENOBSERVE_VERSION-linux-arm64.tar.gz" "$source"
   tar -xzf "$source" -C "$stage/bin"
-  local upstream_binary
-  upstream_binary="$(find "$stage/bin" -maxdepth 2 -type f -name openobserve -print -quit)"
-  cp "$upstream_binary" "$stage/bin/openobserve.bin"
-  rm -f "$upstream_binary"
-  bundle_glibc_runtime_closure "$stage" "$stage/bin/openobserve.bin"
-  cat >"$stage/bin/openobserve" <<'EOF'
-#!/bin/sh
-# Launches OpenObserve through the Runtime-local aarch64 glibc loader.
-BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec "$BASE/lib/ld-linux-aarch64.so.1" --inhibit-cache --library-path "$BASE/lib" "$BASE/bin/openobserve.bin" "$@"
-EOF
-  chmod 755 "$stage/bin/openobserve"
   apply_contract openobserve "$OPENOBSERVE_VERSION" "$stage"
+  strip_glibc_and_loader "$stage"
+  assert_no_glibc_or_loader "$stage"
   write_metadata openobserve "$OPENOBSERVE_VERSION" "$stage" "$source"
   {
-    echo 'Packaging: official optimized release binary'
-    echo 'Compatibility: bundled glibc loader/runtime closure (ld-linux + libc paired)'
+    echo 'Runtime linkage: glibc-fallback'
+    echo 'Packaging: official binary without bundled glibc (experimental; may fail verify GLIBC gate)'
+    echo 'Compatibility: host glibc only; L1 not declared until ≤2.36'
   } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/openobserve/$OPENOBSERVE_VERSION"
+  write_glibc_fallback_marker "$output_dir" openobserve "$OPENOBSERVE_VERSION" \
+    'official glibc binary only; musl release preferred'
+  record_linkage_manifest openobserve "$OPENOBSERVE_VERSION" glibc-fallback \
+    'official glibc arm64 binary (experimental / L1 deferred)'
   package_runtime openobserve "$OPENOBSERVE_VERSION" "$stage"
 }
 
 # Builds FFmpeg from source on manylinux2014 so required GLIBC stays ≤ 2.17.
-# External codecs are statically linked; the archive ships only ffmpeg/ffprobe.
-build_ffmpeg() {
+build_ffmpeg_glibc_source() {
   local stage="$STAGE_ROOT/ffmpeg"
   local source="$SOURCE_ROOT/ffmpeg-$FFMPEG_VERSION.tar.xz"
   local x264_source="$SOURCE_ROOT/x264-stable.tar.bz2"
@@ -795,9 +978,15 @@ build_ffmpeg() {
   assert_no_forbidden_host_libs "$stage"
   write_metadata ffmpeg "$FFMPEG_VERSION" "$stage" "$source" "$x264_source" "$opus_source"
   {
+    echo 'Runtime linkage: glibc-fallback'
     echo 'Optimization: -O3, static libx264 + libopus'
     echo 'Linkage: statically linked codec libraries; glibc from host'
   } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/ffmpeg/$FFMPEG_VERSION"
+  write_glibc_fallback_marker "$output_dir" ffmpeg "$FFMPEG_VERSION" \
+    'Alpine musl path disabled or unavailable for this invocation'
+  record_linkage_manifest ffmpeg "$FFMPEG_VERSION" glibc-fallback \
+    'source build on manylinux2014'
   package_runtime ffmpeg "$FFMPEG_VERSION" "$stage"
 }
 
@@ -997,16 +1186,28 @@ EOF
   fi
   apply_contract poppler "$POPPLER_VERSION" "$stage"
   bundle_third_party_dependencies "$stage" "$stage/bin/pdftotext" "$stage/bin/pdftoppm" "$stage/bin/pdfinfo"
-  assert_glibc_closure_complete "$stage"
+  strip_glibc_and_loader "$stage"
+  strip_libcrypt_from_stage "$stage"
+  set_component_runpaths "$stage"
+  assert_no_glibc_or_loader "$stage"
   write_metadata poppler "$POPPLER_VERSION" "$stage" \
     "$source" "$freetype_source" "$fontconfig_source" "$tiff_source" "$lcms_source"
   {
+    echo 'Runtime linkage: glibc-fallback'
     echo 'Linkage: Poppler + vendor third-party runtime libraries; glibc from host'
+    echo 'RUNPATH: $ORIGIN/../lib:$ORIGIN/../../../common-libs/current/lib'
+    echo 'Musl status: UNSUPPORTED-MUSL — Alpine lacks poppler 26.07.0; built from upstream source'
   } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/poppler/$POPPLER_VERSION"
+  write_glibc_fallback_marker "$output_dir" poppler "$POPPLER_VERSION" \
+    'no official musl package for pinned poppler 26.07.0'
+  record_linkage_manifest poppler "$POPPLER_VERSION" glibc-fallback \
+    'source build on manylinux2014 (Alpine max << 26.07.0)'
   package_runtime poppler "$POPPLER_VERSION" "$stage"
 }
 
-# Packages the official LibreOffice aarch64 release with a complete glibc closure.
+# Packages LibreOffice aarch64 (L2 optional): strip glibc/loader, rewrite absolute links,
+# keep libcrypt only in common-libs, launch via host glibc.
 build_libreoffice() {
   local stage="$STAGE_ROOT/libreoffice"
   local source="$SOURCE_ROOT/LibreOffice_${LIBREOFFICE_VERSION}_Linux_aarch64_deb.tar.gz"
@@ -1023,40 +1224,55 @@ build_libreoffice() {
   cp -a "$office_root/." "$stage/"
   find "$stage/opt" -depth -delete
   mkdir -p "$stage/bin" "$stage/lib"
-  bundle_elf_tree_glibc_closure "$stage" "$stage/program"
-  # Also copy gconv modules required when launching through the bundled loader.
-  if [[ -d /usr/lib64/gconv ]]; then
-    mkdir -p "$stage/lib/gconv"
-    cp -a /usr/lib64/gconv/. "$stage/lib/gconv/" 2>/dev/null || true
-  elif [[ -d /usr/lib/gconv ]]; then
-    mkdir -p "$stage/lib/gconv"
-    cp -a /usr/lib/gconv/. "$stage/lib/gconv/" 2>/dev/null || true
-  fi
+  strip_glibc_and_loader "$stage"
+  strip_libcrypt_from_stage "$stage"
   cat >"$stage/bin/libreoffice" <<'EOF'
 #!/bin/sh
-# Launches LibreOffice headlessly through the Runtime-local aarch64 glibc loader.
+# Launches LibreOffice headlessly using host glibc and package-local libraries.
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-export GCONV_PATH="$BASE/lib/gconv"
-exec "$BASE/lib/ld-linux-aarch64.so.1" --inhibit-cache --library-path "$BASE/program:$BASE/lib" "$BASE/program/soffice.bin" "$@"
+export LD_LIBRARY_PATH="$BASE/program:$BASE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$BASE/program/soffice.bin" "$@"
 EOF
   cp "$stage/bin/libreoffice" "$stage/bin/soffice"
   chmod 755 "$stage/bin/libreoffice" "$stage/bin/soffice"
+  if [[ -f "$stage/program/soffice.bin" ]]; then
+    patchelf --set-rpath '\$ORIGIN:\$ORIGIN/../lib:\$ORIGIN/../../../common-libs/current/lib' \
+      "$stage/program/soffice.bin" 2>/dev/null || true
+  fi
   apply_contract libreoffice "$LIBREOFFICE_VERSION" "$stage"
+  assert_no_glibc_or_loader "$stage"
   write_metadata libreoffice "$LIBREOFFICE_VERSION" "$stage" "$source"
   {
-    echo 'Packaging: official deb release binaries'
-    echo 'Compatibility: bundled loader and complete runtime dependency closure'
+    echo 'Runtime linkage: glibc-fallback'
+    echo 'Packaging: official deb release binaries; glibc/loader stripped'
+    echo 'Compatibility: host glibc; libcrypt via common-libs RUNPATH'
+    echo 'Layer: L2 optional — not part of aarch64 L0 default catalog'
+    echo 'Musl status: UNSUPPORTED-MUSL — no official musl/libreoffice for pinned 26.2.4'
   } >>"$stage/BUILDINFO"
+  local output_dir="$OUTPUT_ROOT/libreoffice/$LIBREOFFICE_VERSION"
+  write_glibc_fallback_marker "$output_dir" libreoffice "$LIBREOFFICE_VERSION" \
+    'no official musl/libreoffice release for pinned version'
+  record_linkage_manifest libreoffice "$LIBREOFFICE_VERSION" glibc-fallback \
+    'official deb repackaged; glibc host required'
   package_runtime libreoffice "$LIBREOFFICE_VERSION" "$stage"
 }
 
+# musl entry wrappers (build_* dispatch) live in build-aarch64-musl.sh.
+# shellcheck source=build-aarch64-musl.sh
+source "$RUNTIME_BUILD_DIR/build-aarch64-musl.sh"
+
 # Dispatches requested component builds in dependency-cost order.
+# Hybrid publish set: musl official delivery for L0 infra; glibc-fallback for poppler/libreoffice/common-libs.
+# OpenObserve uses official musl release when MDV_LINKAGE_openobserve=musl-official-bin (default).
 main() {
   [[ "$(uname -m)" == "aarch64" ]]
   mkdir -p "$SOURCE_ROOT" "$STAGE_ROOT" "$VENDOR_ROOT" "$OUTPUT_ROOT"
+  rm -f "${MDV_LINKAGE_TSV:-$OUTPUT_ROOT/.linkage-manifest.tsv}"
   install_build_dependencies
   echo "Build host glibc: $(ldd --version | head -1)"
   echo "Compiler: $(gcc --version | head -1)"
+  echo "Hybrid linkage policy: official musl first; glibc-source fallback (see aarch64-linkage.env)"
+  component_selected common-libs && build_common_libs
   component_selected tusd && build_tusd
   component_selected opentelemetry && build_opentelemetry
   component_selected openobserve && build_openobserve
@@ -1067,6 +1283,7 @@ main() {
   component_selected ffmpeg && build_ffmpeg
   component_selected poppler && build_poppler
   component_selected libreoffice && build_libreoffice
+  write_linkage_manifest_file
   chown -R "${MDV_HOST_UID:-0}:${MDV_HOST_GID:-0}" "$OUTPUT_ROOT"
 }
 

@@ -1,0 +1,48 @@
+schemaVersion: 1
+platform: linux-aarch64-hybrid
+generatedBy: scripts/runtime-build/build-aarch64.sh
+components:
+  - name: common-libs
+    version: 1.0.0
+    linkage: glibc-fallback
+    note: "libcrypt bundle for glibc RUNPATH components only"
+  - name: tusd
+    version: 2.9.2
+    linkage: musl-static-bin
+    note: "Official static Go binary; no musl/glibc shipped"
+  - name: opentelemetry
+    version: 0.156.0
+    linkage: musl-static-bin
+    note: "Official static Go binaries; no musl/glibc shipped"
+  - name: openobserve
+    version: 0.91.1
+    linkage: musl-official-bin
+    note: "Official openobserve-*-linux-arm64-musl release"
+  - name: nginx
+    version: 1.28.3
+    linkage: musl-official-apk
+    note: "Delivery: Alpine v3.22 nginx-1.28.3-r6 (+ pcre2, openssl, zlib)"
+  - name: zeromq
+    version: 4.3.5
+    linkage: musl-official-apk
+    note: "Delivery: Alpine v3.22 zeromq-4.3.5-r2 (+ libsodium)"
+  - name: redis
+    version: 8.8.0
+    linkage: musl-official-apk
+    note: "Delivery: Alpine edge redis-8.8.0-r0"
+  - name: postgresql
+    version: 17.10
+    linkage: musl-official-apk
+    note: "Delivery: Alpine v3.22 postgresql17-17.10-r0 (+ client/common/icu/openssl/xml/ldap runtime closure)"
+  - name: ffmpeg
+    version: 8.1.2
+    linkage: musl-official-apk
+    note: "Delivery: Alpine edge ffmpeg-8.1.2-r0 (+ libav* runtime libs)"
+  - name: poppler
+    version: 26.07.0
+    linkage: glibc-fallback
+    note: "source build on manylinux2014 (Alpine max << 26.07.0)"
+  - name: libreoffice
+    version: 26.2.4
+    linkage: glibc-fallback
+    note: "official deb repackaged; glibc host required"

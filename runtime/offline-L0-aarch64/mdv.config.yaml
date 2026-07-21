@@ -1,0 +1,36 @@
+name: modiverse
+version: "1.0.0"
+baseURL: "file:///opt/mdv-offline-L0-aarch64/runtime"
+software:
+  common-libs:
+    version: "1.0.0"
+    path: "common-libs/common-libs-1.0.0-linux-{arch}.tar.gz"
+  nginx:
+    version: "1.28.3"
+    path: "nginx/nginx-1.28.3-linux-{arch}.tar.gz"
+    port: 80
+  postgresql:
+    version: "17.10"
+    path: "postgresql/postgresql-17.10-linux-{arch}.tar.gz"
+    port: 5432
+  redis:
+    version: "8.8.0"
+    path: "redis/redis-8.8.0-linux-{arch}.tar.gz"
+    port: 6379
+  zeromq:
+    version: "4.3.5"
+    path: "zeromq/zeromq-4.3.5-linux-{arch}.tar.gz"
+  tusd:
+    version: "2.9.2"
+    path: "tusd/tusd-2.9.2-linux-{arch}.tar.gz"
+    port: 1080
+  opentelemetry:
+    version: "0.156.0"
+    path: "opentelemetry/opentelemetry-collector-0.156.0-linux-{arch}.tar.gz"
+    port: 4317
+  ffmpeg:
+    version: "8.1.2"
+    path: "ffmpeg/ffmpeg-8.1.2-linux-{arch}.tar.gz"
+  poppler:
+    version: "26.07.0"
+    path: "poppler/poppler-26.07.0-linux-{arch}.tar.gz"

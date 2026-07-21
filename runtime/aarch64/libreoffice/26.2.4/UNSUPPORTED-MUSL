@@ -1,0 +1,5 @@
+component: libreoffice
+version: 26.2.4
+runtime_linkage: glibc-fallback
+reason: no official musl/libreoffice release for pinned version
+delivery: built from official upstream source on manylinux2014 (glibc 2.17 baseline)
